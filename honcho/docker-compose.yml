@@ -1,0 +1,107 @@
+# Honcho - isolated local install (copy into your Honcho checkout, next to its Dockerfile)
+# - No host directories mounted (only named Docker volumes) -> no access to your files
+# - MCP server exposed on 127.0.0.1:3100 for Claude Code; it can only call the Honcho API
+# - DB/Redis on an internal network only (no host ports, no internet)
+# - API bound to 127.0.0.1:8000
+
+x-hardening: &hardening
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+
+
+services:
+  api:
+    <<: *hardening
+    build: { context: ., dockerfile: Dockerfile }
+    image: honcho-local:latest
+    entrypoint: ["sh", "docker/entrypoint.sh"]
+    depends_on:
+      database: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    ports: ["127.0.0.1:8000:8000"]
+    networks: [backend, egress, mcpnet]
+    env_file: .env
+    environment:
+      - DB_CONNECTION_URI=postgresql+psycopg://postgres:${POSTGRES_PASSWORD}@database:5432/postgres
+      - CACHE_URL=redis://redis:6379/0?suppress=true
+      - CACHE_ENABLED=true
+    healthcheck:
+      test: ["CMD", "/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  deriver:
+    <<: *hardening
+    image: honcho-local:latest
+    entrypoint: ["/app/.venv/bin/python", "-m", "src.deriver"]
+    depends_on:
+      api: { condition: service_healthy }
+    networks: [backend, egress]
+    env_file: .env
+    environment:
+      - DB_CONNECTION_URI=postgresql+psycopg://postgres:${POSTGRES_PASSWORD}@database:5432/postgres
+      - CACHE_URL=redis://redis:6379/0?suppress=true
+      - CACHE_ENABLED=true
+    restart: unless-stopped
+
+  mcp:
+    <<: *hardening
+    build: { context: ./mcp, dockerfile: Dockerfile }
+    image: honcho-mcp-local:latest
+    depends_on:
+      api: { condition: service_healthy }
+    ports: ["127.0.0.1:3100:3000"]
+    networks: [mcpnet]      # can reach the API only - no DB, no Redis, no host files
+    environment:            # no .env here: MCP never sees DB password / LLM keys
+      - HONCHO_API_URL=http://api:8000
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:3000/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  database:
+    image: pgvector/pgvector:pg15
+    security_opt: ["no-new-privileges:true"]
+    command: ["postgres", "-c", "max_connections=200"]
+    networks: [backend]
+    environment:
+      - POSTGRES_DB=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - pgdata:/var/lib/postgresql/data/
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:8.2
+    security_opt: ["no-new-privileges:true"]
+    networks: [backend]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+networks:
+  backend:
+    internal: true   # no internet, no host access
+  mcpnet: {}         # MCP <-> API only (non-internal so port 3100 can be published)
+  egress: {}         # api/deriver only: needed to reach the LLM provider API
+
+volumes:
+  pgdata:
+  redis-data:

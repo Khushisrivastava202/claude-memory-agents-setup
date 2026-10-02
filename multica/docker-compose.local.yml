@@ -1,0 +1,23 @@
+# Local hardening overrides (loaded automatically via COMPOSE_FILE in .env)
+# - Board only: no multica CLI / daemon on the host -> agents get no access to your files
+# - No host directories mounted (named volumes only)
+# - Postgres on an internal network: no host port, no internet
+x-hardening: &hardening
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+
+services:
+  postgres:
+    security_opt: ["no-new-privileges:true"]
+    networks: [db]
+  backend:
+    <<: *hardening
+    networks: [db, web]
+  frontend:
+    <<: *hardening
+    networks: [web]
+
+networks:
+  db:
+    internal: true
+  web: {}
